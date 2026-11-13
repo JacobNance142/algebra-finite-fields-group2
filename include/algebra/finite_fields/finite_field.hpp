@@ -4,8 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <mutex>
 #include <ostream>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <algebra/finite_fields/modulus.hpp>
 
@@ -22,20 +24,45 @@ class FiniteFieldElement : public AdditiveOperators<FiniteFieldElement<P, K, Mod
     static_assert(K > 0);
 
 public:
+    struct CacheKey {
+        FiniteFieldElement<P, K, ModulusPolicy> firstOperand;
+        FiniteFieldElement<P, K, ModulusPolicy> secondOperand;
+
+        bool operator==(const CacheKey& other) const {
+            return firstOperand == other.firstOperand && secondOperand == other.secondOperand;
+        };
+    };
     using parent_type = FiniteField<P, K, ModulusPolicy>;
     using algebra = FieldDescriptor;
     using coefficient_type = PrimeFieldElement<P>;
     using polynomial_type = Polynomial<coefficient_type>;
+    using additionCache = std::unordered_map<std::int64_t, std::int64_t>;
+    using multiplicationCache = std::unordered_map<std::int64_t, std::int64_t>;
+    using reciprocalCache = std::unordered_map<std::int64_t, std::int64_t>;
 
 private:
     polynomial_type value_;
     struct Reduced {};
 
     FiniteFieldElement(polynomial_type value, Reduced) : value_(std::move(value)) {}
+    inline static additionCache additionCache_{};
+    inline static multiplicationCache multiplicationCache_{};
+    inline static reciprocalCache reciprocalCache_{};
 
 public:
     FiniteFieldElement() {
         static_cast<void>(parent_type::modulus());
+    }
+
+    std::uint64_t index() const {
+        std::uint64_t result = 0;
+        std::uint64_t mult = 1;
+        for (std::size_t i = 0; i < K; i++)
+        {
+            result += value_.coefficient(i).representative() * mult;
+            mult *= P;
+        }
+        return result;
     }
 
     static FiniteFieldElement from_polynomial(const polynomial_type& value) {
@@ -68,6 +95,32 @@ public:
         return from_polynomial(value);
     }
 
+    static void fill_caches()
+    {
+        static std::once_flag flag;
+        std::call_once(flag, [] { 
+            const auto cardinality = parent_type::cardinality();
+            for (std::uint64_t i = 0; i < cardinality; i++)
+            {
+                const auto a = from_index(i);
+                if (i != 0)
+                {
+                    const auto inv = a.reciprocal();
+                    reciprocalCache_.emplace(i, inv.index());
+                }
+                for (std::uint64_t j = 0; j < cardinality; j++)
+                {
+                    const auto b = from_index(j);
+                    const auto sum = a.add(b);
+                    const auto product = a.multiply(b);
+
+                    additionCache_.emplace(i * cardinality + j, from_polynomial(a.value_.add(b.value_)).index());
+                    multiplicationCache_.emplace(i * cardinality + j, from_polynomial(a.value_.multiply(b.value_)).index());
+                }
+            }
+        });
+    }
+
     static FiniteFieldElement zero() {
         return FiniteFieldElement{};
     }
@@ -77,6 +130,9 @@ public:
     }
 
     FiniteFieldElement add(const FiniteFieldElement& other) const {
+        if (additionCache_.find(index() * parent_type::cardinality() + other.index()) != additionCache_.end()) {
+            return from_index(additionCache_[index() * parent_type::cardinality() + other.index()]);
+        }
         const polynomial_type sum = value_.add(other.value_);
         return from_polynomial(sum);
     }
@@ -86,6 +142,9 @@ public:
     }
 
     FiniteFieldElement multiply(const FiniteFieldElement& other) const {
+        if (multiplicationCache_.find(index() * parent_type::cardinality() + other.index()) != multiplicationCache_.end()) {
+            return from_index(multiplicationCache_[index() * parent_type::cardinality() + other.index()]);
+        }
         const polynomial_type product = value_.multiply(other.value_);
         return from_polynomial(product);
     }
@@ -93,6 +152,10 @@ public:
     FiniteFieldElement reciprocal() const {
         if (is_zero()) {
             throw std::domain_error("Zero has no reciprocal");
+        }
+        const auto found = reciprocalCache_.find(index());
+        if (found != reciprocalCache_.end()) {
+            return from_index(found->second);
         }
         polynomial_type previous_remainder = parent_type::modulus();
         polynomial_type remainder = value_;
@@ -186,6 +249,7 @@ public:
 
     static void initialize() {
         static_cast<void>(modulus());
+        Element::fill_caches();
     }
 
     static std::uint64_t cardinality() {
